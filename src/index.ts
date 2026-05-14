@@ -10,11 +10,31 @@ import { productsRouter } from "./routes/products.js";
 import { logsRouter } from "./routes/logs.js";
 import { requireAuth } from "./auth.js";
 import { startScheduler } from "./workers/scheduler.js";
-import { log } from "./lib/log.js";
+import { log, startLogPruner } from "./lib/log.js";
+import { recoverInFlightProducts } from "./services/recovery.js";
 
 const app = new Hono();
 
-app.use("/*", cors({ origin: (o) => o ?? "*", credentials: true, allowHeaders: ["Authorization", "Content-Type"] }));
+// CORS — in dev (no ALLOWED_ORIGINS) we echo whichever origin called us.
+// In prod, the env var holds a comma-separated allowlist (e.g. the admin
+// Firebase Hosting domain that embeds /sync).
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  "/*",
+  cors({
+    origin: (o) => {
+      if (!o) return "*";
+      if (allowedOrigins.length === 0) return o; // dev / any
+      return allowedOrigins.includes(o) ? o : null;
+    },
+    credentials: true,
+    allowHeaders: ["Authorization", "Content-Type"],
+  }),
+);
 
 app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
@@ -42,4 +62,11 @@ serve({ fetch: app.fetch, port }, ({ port }) => {
   console.log(`[backend] listening on http://localhost:${port}`);
   log({ level: "info", message: `Backend started on :${port}`, step: "system" }).catch(() => {});
   startScheduler();
+  startLogPruner();
+  // Recover any products left in "running" from a previous crash. Cleans
+  // partial Shopify/Toastd resources and resets state so the next sync run
+  // re-creates them from step 1.
+  recoverInFlightProducts().catch((e) =>
+    log({ level: "error", message: `Recovery sweep failed: ${e.message}`, step: "system" }).catch(() => {}),
+  );
 });

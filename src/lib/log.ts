@@ -29,6 +29,10 @@ const PERSIST_LEVELS: ReadonlySet<LogLevel> =
     ? new Set<LogLevel>(["info", "warn", "error", "success"])
     : new Set<LogLevel>(["warn", "error", "success"]);
 
+/** Retention: prune logs older than this on a slow timer. */
+const RETENTION_MS = Number(process.env.LOG_RETENTION_MS || 14 * 24 * 60 * 60 * 1000); // 14 days
+const PRUNE_INTERVAL_MS = Number(process.env.LOG_PRUNE_INTERVAL_MS || 6 * 60 * 60 * 1000); // every 6 h
+
 /**
  * Batched writer. Logs queued up here are flushed to Firestore in a single
  * batched commit every FLUSH_INTERVAL_MS, or eagerly when the buffer hits
@@ -84,13 +88,52 @@ function scheduleFlush() {
   }, FLUSH_INTERVAL_MS);
 }
 
-// Drain the queue on shutdown so we don't lose buffered logs in dev/CI.
-const shutdown = () => {
-  void flush();
-};
+// Drain the queue on shutdown so we don't lose buffered logs. Cloud Run sends
+// SIGTERM and gives ~10s before SIGKILL — block on the flush so it actually
+// completes instead of getting dropped.
+async function shutdown() {
+  try {
+    await flush();
+  } catch {}
+}
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 process.once("beforeExit", shutdown);
+
+/**
+ * Background pruner — keeps the event_logs collection bounded so reads stay
+ * cheap and storage doesn't grow unbounded. Runs on an interval, deleting in
+ * batches of up to 400 (Firestore batch cap = 500, leave headroom).
+ */
+async function pruneOldLogs() {
+  try {
+    const cutoff = Date.now() - RETENTION_MS;
+    while (true) {
+      const snap = await Collections.eventLogs
+        .where("ts", "<", cutoff)
+        .orderBy("ts", "asc")
+        .limit(400)
+        .get();
+      if (snap.empty) break;
+      const batch = Collections.eventLogs.firestore.batch();
+      snap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+      if (snap.size < 400) break; // last page
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("log pruner failed (will retry next tick):", e);
+  }
+}
+
+let prunerStarted = false;
+export function startLogPruner() {
+  if (prunerStarted) return;
+  prunerStarted = true;
+  // Stagger the first run by a minute so dev restarts don't dogpile.
+  setTimeout(() => void pruneOldLogs(), 60_000);
+  setInterval(() => void pruneOldLogs(), PRUNE_INTERVAL_MS).unref?.();
+}
 
 export async function log(entry: Omit<LogEntry, "ts"> & { ts?: number }) {
   const full: LogEntry = { ts: entry.ts ?? Date.now(), ...entry };

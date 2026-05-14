@@ -161,7 +161,7 @@ export async function runStep3(
   vendor: VendorRecord,
   alienProduct: any,
   shopifyProductGid: string,
-  onProductCreated?: (toastdProductId: string) => void,
+  onProductCreated?: (toastdProductId: string) => void | Promise<void>,
   onImageUploaded?: () => void,
 ) {
   if (!vendor.brandId) throw new Error("vendor has no brandId mapped");
@@ -236,7 +236,7 @@ export async function runStep3(
   };
   const created = await createProduct(productPayload, tdTok);
   const newProductId: string = created.id;
-  onProductCreated?.(newProductId);
+  await onProductCreated?.(newProductId);
   await log({
     level: "success",
     message: `Step 3b: product saved id=${newProductId}`,
@@ -507,11 +507,17 @@ export async function syncOneProduct(
     // Step 3
     let toastdProductId: string | undefined = prev.step3?.toastdProductId;
     if (!prev.step3?.completedAt) {
-      const r3 = await runStep3(vendor, alienProduct, shopifyProductGid, (id) => {
+      const r3 = await runStep3(vendor, alienProduct, shopifyProductGid, async (id) => {
         // Capture toastdProductId as soon as the DB record is created (step 3b),
-        // BEFORE images upload — so a failure mid-3c is rolled back too.
+        // BEFORE images upload — so a failure mid-3c is rolled back too. We
+        // also persist it eagerly so a process crash after this point is
+        // still recoverable (startup sweep reads it back and rolls back).
         toastdProductId = id;
         created.toastdProductId = id;
+        await ref.set(
+          { step3: { ...(prev.step3 ?? {}), toastdProductId: id }, updatedAt: Date.now() },
+          { merge: true },
+        );
       }, () => {
         created.step3ImagesUploaded += 1;
       });
