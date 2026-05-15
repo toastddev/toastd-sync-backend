@@ -39,28 +39,47 @@ export async function recoverInFlightProducts(): Promise<void> {
     // If a Toastd record exists and already has images attached, preserve it —
     // the product is load-bearing for downstream consumers; matches the
     // canRollback() heuristic the in-process catch uses.
-    let toastdSafe = true;
+    //   - filesCount > 0  → preserve (we'd be deleting user-visible images)
+    //   - filesCount == 0 → safe to roll back; the DB row is empty
+    //   - lookup failed   → preserve; without a count we can't safely delete
+    let filesCount: number | null = null;
+    let lookupFailed = false;
     if (toastdId && settings.toastdAdminToken) {
       try {
         const files = await listProductFiles(toastdId, settings.toastdAdminToken);
-        if (files.length > 0) toastdSafe = false;
+        filesCount = files.length;
       } catch {
-        // Can't tell — err on the side of preserving.
-        toastdSafe = false;
+        lookupFailed = true;
       }
     }
+    const toastdSafe = !toastdId || (filesCount === 0 && !lookupFailed);
 
     if (!toastdSafe) {
+      // Distinguish the "actually has images" path from "we couldn't tell" so
+      // the operator can act on either signal — the old single message
+      // claimed images existed even when the lookup had failed.
+      const reasonMsg = lookupFailed
+        ? "Recovery: preserving partial product (image lookup failed — manual review)"
+        : `Recovery: preserving partial product (already has ${filesCount} Toastd image${filesCount === 1 ? "" : "s"})`;
       await log({
         level: "warn",
-        message: `Recovery: preserving partial product (already has Toastd images)`,
+        message: reasonMsg,
         vendorId: String(p.vendorShopId ?? ""),
         productId: String(p.alienProductId ?? ""),
         productTitle: p.title,
         step: "system",
       }).catch(() => {});
       await doc.ref
-        .set({ pipelineStatus: "error", lastError: "interrupted mid-images — needs manual review", updatedAt: Date.now() }, { merge: true })
+        .set(
+          {
+            pipelineStatus: "error",
+            lastError: lookupFailed
+              ? "interrupted mid-images and image lookup failed — needs manual review"
+              : `interrupted mid-images (${filesCount} image${filesCount === 1 ? "" : "s"} attached) — needs manual review`,
+            updatedAt: Date.now(),
+          },
+          { merge: true },
+        )
         .catch(() => {});
       preserved += 1;
       continue;

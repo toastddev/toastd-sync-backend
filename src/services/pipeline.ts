@@ -28,6 +28,7 @@ import {
   recordFile,
   uploadToGcs,
   VendorProductNotFoundError,
+  warmAssetUrl,
 } from "./toastd.js";
 import { getSettings } from "../routes/settings.js";
 import type { ProductRecord, Settings, VendorRecord } from "../types.js";
@@ -319,15 +320,22 @@ export async function runStep3(
       const objectKey = `${brandSlug}/${slug}/images/${fileName}`;
       const presigned = await getPresignedUrl(objectKey, "image/webp", tdTok);
       await uploadToGcs(presigned, buf, "image/webp");
+      const assetUrl = `${ASSETS_BASE_URL}/${objectKey}`;
       await recordFile({
         name: fileName,
-        url: `${ASSETS_BASE_URL}/${objectKey}`,
+        url: assetUrl,
         fileType: "image",
         productId: newProductId,
         alt: null,
         thumbnailUrl: null,
         variant: null,
       }, tdTok);
+      // CDN warm-up: GET the public asset URL so assets.toastd.in caches the
+      // object at the edge. Without this the first time the storefront asks
+      // for the image it pays the origin round-trip and can briefly 404 /
+      // serve a placeholder. Awaited so the storefront never sees a colder
+      // edge than the pipeline did.
+      await warmAssetUrl(assetUrl);
       imagesUploaded += 1;
       onImageUploaded?.();
       await log({

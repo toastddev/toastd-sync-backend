@@ -249,3 +249,22 @@ export async function downloadAndConvertWebp(srcUrl: string): Promise<Buffer> {
 }
 
 export const ASSETS_BASE_URL = "https://assets.toastd.in";
+
+/**
+ * Warm the CDN edge for a just-uploaded asset by issuing a GET against the
+ * public URL. GCS writes are strongly consistent at the bucket but the
+ * assets.toastd.in CDN in front of it sits idle until something asks for the
+ * key — without this nudge the frontend's first <img> request paid the cold
+ * fetch latency and occasionally rendered a placeholder before the byte
+ * arrived. Best-effort only; never throw — the upload itself has already
+ * landed by the time we get here.
+ */
+export async function warmAssetUrl(assetUrl: string): Promise<void> {
+  try {
+    const res = await request(assetUrl, { method: "GET" });
+    // Drain so the connection can be reused / GC'd.
+    await res.body.arrayBuffer().catch(() => {});
+  } catch {
+    /* swallow — warmup is opportunistic */
+  }
+}
