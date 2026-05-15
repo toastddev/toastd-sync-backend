@@ -33,6 +33,19 @@ import type { ProductRecord, Settings, VendorRecord } from "../types.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Thrown by Step 3b when the Toastd backend reports a product with the same
+ * slug already exists. The catch path special-cases this to delete the
+ * just-created Shopify product (which is now an orphan) and to mark the run
+ * as "skipped_existing" rather than a true error.
+ */
+export class ProductAlreadyExistsError extends Error {
+  constructor(public existingToastdProductId: string, public slug: string) {
+    super(`Toastd product with slug "${slug}" already exists (id=${existingToastdProductId})`);
+    this.name = "ProductAlreadyExistsError";
+  }
+}
+
 export interface RunOpts {
   jobId?: string;
   onProgress?: (p: { processed: number; total: number; currentTitle?: string }) => Promise<void> | void;
@@ -236,6 +249,23 @@ export async function runStep3(
   };
   const created = await createProduct(productPayload, tdTok);
   const newProductId: string = created.id;
+  // Toastd returns existed:true when a row with the same slug was already in
+  // the DB. Don't claim ownership of it (no onProductCreated callback) and
+  // don't run Step 3c — the existing product likely already has curated images
+  // we don't want to overwrite. Caller catches and rolls back the Shopify
+  // product we created upstream so no orphan remains.
+  if (created.existed === true) {
+    await log({
+      level: "warn",
+      message: `Step 3b: Toastd product with slug "${productPayload.slug}" already exists (id=${newProductId}); rolling back Shopify orphan`,
+      vendorId: vendor.id,
+      vendorName: vendor.title,
+      productId: newProductId,
+      productTitle: alienProduct.title,
+      step: "step3b",
+    });
+    throw new ProductAlreadyExistsError(newProductId, productPayload.slug);
+  }
   await onProductCreated?.(newProductId);
   await log({
     level: "success",
@@ -552,7 +582,12 @@ export async function syncOneProduct(
       await ref.set({ pipelineStatus: "pending", lastError: e.message, updatedAt: Date.now() }, { merge: true });
       throw e;
     }
-    const reason = e instanceof ShopifyAuthError ? "shopify_auth" : "error";
+    const alreadyExists = e instanceof ProductAlreadyExistsError;
+    const reason = e instanceof ShopifyAuthError
+      ? "shopify_auth"
+      : alreadyExists
+      ? "already_exists"
+      : "error";
     const titleForLog = (alienProductHint as any)?.title ?? prev?.title;
 
     // Transactional rollback. Only roll back resources we created in *this*
@@ -585,10 +620,15 @@ export async function syncOneProduct(
       }
     }
 
+    const finalStatus = alreadyExists
+      ? "skipped_existing"
+      : rolledBack
+      ? "rolled_back"
+      : "error";
     await ref.set(
       {
-        pipelineStatus: rolledBack ? "rolled_back" : "error",
-        lastError: e.message,
+        pipelineStatus: finalStatus,
+        lastError: alreadyExists ? null : e.message,
         updatedAt: Date.now(),
         // Clear any state we just rolled back — this run is now a clean slate.
         ...(rolledBack
@@ -602,8 +642,10 @@ export async function syncOneProduct(
       { merge: true },
     );
     await log({
-      level: "error",
-      message: rolledBack ? `Pipeline failed and rolled back: ${e.message}` : `Pipeline failed: ${e.message}`,
+      level: alreadyExists ? "warn" : "error",
+      message: alreadyExists
+        ? `Pipeline skipped: ${e.message}; Shopify orphan ${rolledBack ? "rolled back" : "left in place"}`
+        : rolledBack ? `Pipeline failed and rolled back: ${e.message}` : `Pipeline failed: ${e.message}`,
       vendorId: vendor.id,
       vendorName: vendor.title,
       productId: String(alienProductId),
@@ -611,7 +653,9 @@ export async function syncOneProduct(
       step: "system",
       meta: { reason, rolledBack },
     });
-    return { ok: false, productDocId: id, reason: e.message };
+    // Already-exists isn't a failure — the goal (this product is in Toastd) is
+    // achieved. Report ok:true so vendor sync counts it under "succeeded".
+    return { ok: alreadyExists, productDocId: id, reason: e.message };
   }
 }
 
