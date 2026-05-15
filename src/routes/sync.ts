@@ -22,6 +22,11 @@ interface CurrentJob {
   currentBrandName?: string | null;
   currentVendorName?: string | null;
   currentProductTitle?: string | null;
+  // Step granularity for the per-product progress bar on the Progress page.
+  // Pipeline reports one of: step1, step2, step3a, step3b, step3c, done.
+  // currentStepProgress is 0-100 and refreshes within Step 3c as images upload.
+  currentStep?: string | null;
+  currentStepProgress?: number | null;
   error?: string | null;
 }
 
@@ -112,7 +117,22 @@ async function runProductJob(vendor: VendorRecord, alienProductId: number, trigg
     currentProductTitle: (hint as any)?.title ?? null,
   });
   try {
-    const r = await withShipTurtleAuthRetry(getSettings, () => syncOneProduct(vendor, alienProductId, hint));
+    const r = await withShipTurtleAuthRetry(getSettings, () =>
+      syncOneProduct(
+        vendor,
+        alienProductId,
+        hint,
+        async (info) => {
+          // Pipeline asks us to re-queue this product for another attempt.
+          // Push to the front so retries don't get starved by newer manual maps.
+          await enqueueProductForRetry(info.vendorId, info.alienProductId);
+        },
+        async (s) => {
+          // Step + percent surface to the Progress page via /api/sync/status.
+          await bumpJob({ currentStep: s.step, currentStepProgress: s.progress ?? 0 });
+        },
+      ),
+    );
     await bumpJob({
       processed: 1,
       succeeded: r.ok ? 1 : 0,
@@ -123,6 +143,32 @@ async function runProductJob(vendor: VendorRecord, alienProductId: number, trigg
     await log({ level: "error", message: `Product sync failed: ${e.message}`, vendorId: vendor.id });
     await endJob("error", e.message);
   }
+}
+
+/**
+ * Re-queue a product that the pipeline rolled back and asked to retry. We push
+ * to the FRONT so the retry runs ahead of newer manual map clicks — keeping a
+ * single product's lifecycle contiguous in the log and freeing the slot
+ * predictably. retryCount is bumped by the pipeline before this fires.
+ */
+async function enqueueProductForRetry(vendorId: string, alienProductId: number) {
+  const snap = await Collections.vendors.doc(vendorId).get();
+  if (!snap.exists) return;
+  const vendor = snap.data() as VendorRecord;
+  let productTitle: string | null = null;
+  try {
+    const ps = await Collections.products.doc(`${vendor.vendorShopId}_${alienProductId}`).get();
+    if (ps.exists) productTitle = (ps.data() as ProductRecord)?.title ?? null;
+  } catch {}
+  productQueue.unshift({
+    vendorId: vendor.id,
+    vendorShopId: vendor.vendorShopId,
+    alienProductId,
+    vendorName: vendor.title,
+    brandName: vendor.brandName ?? null,
+    productTitle,
+    enqueuedAt: Date.now(),
+  });
 }
 
 /**
@@ -215,6 +261,12 @@ syncRouter.post("/vendor/:id", async (c) => {
         syncVendor(vendor, {
           onProgress: async (p) => {
             await bumpJob({ total: p.total, processed: p.processed, currentProductTitle: p.currentTitle });
+          },
+          onRetryRequested: async (info) => {
+            await enqueueProductForRetry(info.vendorId, info.alienProductId);
+          },
+          onStep: async (s) => {
+            await bumpJob({ currentStep: s.step, currentStepProgress: s.progress ?? 0 });
           },
         }),
       );
@@ -328,6 +380,12 @@ syncRouter.post("/run-all", async (c) => {
                 processed: processed + p.processed,
                 currentProductTitle: p.currentTitle,
               });
+            },
+            onRetryRequested: async (info) => {
+              await enqueueProductForRetry(info.vendorId, info.alienProductId);
+            },
+            onStep: async (s) => {
+              await bumpJob({ currentStep: s.step, currentStepProgress: s.progress ?? 0 });
             },
           }),
         );

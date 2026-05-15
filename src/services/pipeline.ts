@@ -27,6 +27,7 @@ import {
   listProductFiles,
   recordFile,
   uploadToGcs,
+  VendorProductNotFoundError,
 } from "./toastd.js";
 import { getSettings } from "../routes/settings.js";
 import type { ProductRecord, Settings, VendorRecord } from "../types.js";
@@ -46,9 +47,34 @@ export class ProductAlreadyExistsError extends Error {
   }
 }
 
+/**
+ * Thrown by Step 3c when at least one image upload failed. The catch path
+ * unconditionally rolls back the partial Shopify + Toastd state (overriding
+ * the usual "preserve images" guard) and re-enqueues up to MAX_PIPELINE_RETRIES
+ * times so transient network/GCS failures don't leave a half-built product.
+ */
+export class IncompleteImageUploadError extends Error {
+  constructor(
+    public toastdProductId: string,
+    public uploaded: number,
+    public failed: number,
+  ) {
+    super(`Step 3c incomplete: ${uploaded} uploaded, ${failed} failed for productId=${toastdProductId}`);
+    this.name = "IncompleteImageUploadError";
+  }
+}
+
+export const MAX_PIPELINE_RETRIES = 3;
+// Vendor-product-missing is almost certainly permanent (deleted/renamed
+// handle), but we allow a single re-attempt in case the vendor briefly
+// unpublished/republished. After 1 retry we give up and mark the row.
+export const MAX_VENDOR_MISSING_RETRIES = 1;
+
 export interface RunOpts {
   jobId?: string;
   onProgress?: (p: { processed: number; total: number; currentTitle?: string }) => Promise<void> | void;
+  onRetryRequested?: (info: { vendorId: string; alienProductId: number; attempt: number }) => Promise<void> | void;
+  onStep?: (info: { step: string; progress?: number }) => Promise<void> | void;
 }
 
 export interface PipelineResult {
@@ -176,6 +202,7 @@ export async function runStep3(
   shopifyProductGid: string,
   onProductCreated?: (toastdProductId: string) => void | Promise<void>,
   onImageUploaded?: () => void,
+  onTotalImages?: (n: number) => void,
 ) {
   if (!vendor.brandId) throw new Error("vendor has no brandId mapped");
   const settings = await getSettings();
@@ -279,6 +306,9 @@ export async function runStep3(
 
   // Step 3c: image upload pipeline
   const rawimage: string[] = ai.rawimage ?? [];
+  // Tell the caller how many images we're about to attempt so its progress
+  // bar can show denominator-aware percentages from the very first upload.
+  onTotalImages?.(rawimage.length);
   let imagesUploaded = 0;
   let imagesFailed = 0;
   for (let i = 0; i < rawimage.length; i++) {
@@ -322,6 +352,13 @@ export async function runStep3(
         step: "step3c",
       });
     }
+  }
+  // Strict completeness: any failed image reverts the whole pipeline so the
+  // product never lands in Toastd with a missing thumbnail. Caller catches
+  // this, rolls back Shopify + Toastd, increments retryCount, and re-enqueues
+  // up to MAX_PIPELINE_RETRIES.
+  if (imagesFailed > 0) {
+    throw new IncompleteImageUploadError(newProductId, imagesUploaded, imagesFailed);
   }
   return { toastdProductId: newProductId, imagesUploaded, imagesFailed };
 }
@@ -417,6 +454,8 @@ export async function syncOneProduct(
   vendor: VendorRecord,
   alienProductId: number,
   alienProductHint?: any,
+  onRetryRequested?: (info: { vendorId: string; alienProductId: number; attempt: number }) => Promise<void> | void,
+  onStep?: (info: { step: string; progress?: number }) => void | Promise<void>,
 ): Promise<PipelineResult> {
   const settings = await getSettings();
   const productCtx = await loadProduct(vendor.vendorShopId, alienProductId);
@@ -441,6 +480,7 @@ export async function syncOneProduct(
     let merchantProductId = prev.step1?.merchantProductId;
 
     // Step 1: only if not already done
+    await onStep?.({ step: "step1", progress: 0 });
     if (!prev.step1?.completedAt) {
       // We need the live alien product so we can validate status before triggering ShipTurtle.
       if (!alienProduct) {
@@ -522,6 +562,7 @@ export async function syncOneProduct(
     }
 
     // Step 2
+    await onStep?.({ step: "step2", progress: 0 });
     if (!prev.step2?.completedAt) {
       const shopify: ShopifyCreds = { domain: settings.shopifyStoreDomain, adminToken: settings.shopifyAdminToken };
       const r2 = await runStep2(shopify, shopifyProductGid, vendor, alienProduct.title, settings.toastdPublicationNameHint);
@@ -535,8 +576,13 @@ export async function syncOneProduct(
     }
 
     // Step 3
+    await onStep?.({ step: "step3", progress: 0 });
     let toastdProductId: string | undefined = prev.step3?.toastdProductId;
     if (!prev.step3?.completedAt) {
+      // Track expected image count once we have it from runStep3's progress
+      // calls; combined with onImageUploaded ticks this gives a 0–100% bar.
+      let totalImages = 0;
+      let uploadedImages = 0;
       const r3 = await runStep3(vendor, alienProduct, shopifyProductGid, async (id) => {
         // Capture toastdProductId as soon as the DB record is created (step 3b),
         // BEFORE images upload — so a failure mid-3c is rolled back too. We
@@ -548,20 +594,33 @@ export async function syncOneProduct(
           { step3: { ...(prev.step3 ?? {}), toastdProductId: id }, updatedAt: Date.now() },
           { merge: true },
         );
+        // Reaching step 3b means image upload is about to start; bump the bar
+        // to ~50% so the user sees movement before the first image lands.
+        await onStep?.({ step: "step3", progress: 50 });
       }, () => {
         created.step3ImagesUploaded += 1;
+        uploadedImages += 1;
+        if (totalImages > 0) {
+          // Half the bar is "got to step3c"; the other half tracks images.
+          const pct = 50 + Math.min(50, Math.round((uploadedImages / totalImages) * 50));
+          // Fire-and-forget — no need to await the in-memory bumpJob mutation.
+          void onStep?.({ step: "step3", progress: pct });
+        }
+      }, (n: number) => {
+        totalImages = n;
       });
       toastdProductId = r3.toastdProductId;
       await ref.set(
         {
           step3: { completedAt: Date.now(), toastdProductId, imagesUploaded: r3.imagesUploaded, imagesFailed: r3.imagesFailed, error: null },
           pipelineStatus: "done",
+          retryCount: 0,
           updatedAt: Date.now(),
         },
         { merge: true },
       );
     } else {
-      await ref.set({ pipelineStatus: "done", updatedAt: Date.now() }, { merge: true });
+      await ref.set({ pipelineStatus: "done", retryCount: 0, updatedAt: Date.now() }, { merge: true });
     }
 
     await log({
@@ -583,20 +642,29 @@ export async function syncOneProduct(
       throw e;
     }
     const alreadyExists = e instanceof ProductAlreadyExistsError;
+    const incompleteImages = e instanceof IncompleteImageUploadError;
+    const websiteMissing = e instanceof VendorProductNotFoundError;
     const reason = e instanceof ShopifyAuthError
       ? "shopify_auth"
       : alreadyExists
       ? "already_exists"
+      : incompleteImages
+      ? "incomplete_images"
+      : websiteMissing
+      ? "website_product_missing"
       : "error";
     const titleForLog = (alienProductHint as any)?.title ?? prev?.title;
 
-    // Transactional rollback. Only roll back resources we created in *this*
-    // run, and only if the partial product is not yet load-bearing (no images
-    // recorded in Toastd). Auth failures aren't rolled back — they're env
-    // problems, not data inconsistencies.
+    // Transactional rollback. Normally we only roll back when the partial
+    // product is not yet load-bearing (no images in Toastd). But for the
+    // partial-image-upload and website-missing retry paths we MUST roll back
+    // unconditionally — a half-imaged or referenced-but-deleted product is
+    // exactly what we're avoiding by re-enqueuing or marking missing.
     let rolledBack = false;
     if (reason !== "shopify_auth" && (created.shopifyProductGid || created.toastdProductId)) {
-      const safe = await canRollback(created.toastdProductId, created.step3ImagesUploaded, settings.toastdAdminToken);
+      const safe = incompleteImages || websiteMissing
+        ? true
+        : await canRollback(created.toastdProductId, created.step3ImagesUploaded, settings.toastdAdminToken);
       if (safe) {
         await rollbackProduct(
           vendor,
@@ -620,42 +688,126 @@ export async function syncOneProduct(
       }
     }
 
+    // Retry policy: bump retryCount and request a re-enqueue from the caller
+    // (routes/sync.ts owns the in-process queue). Only kick the retry when we
+    // actually rolled back; a stuck rollback means manual review.
+    //   - Partial image upload: up to MAX_PIPELINE_RETRIES (3) — usually
+    //     transient network/GCS issue.
+    //   - Vendor product missing: up to MAX_VENDOR_MISSING_RETRIES (1) — the
+    //     handle is almost certainly permanently gone, but a single retry
+    //     covers a vendor briefly unpublishing/republishing.
+    let willRetry = false;
+    const retryEligible = (incompleteImages || websiteMissing) && rolledBack;
+    if (retryEligible) {
+      const budget = websiteMissing ? MAX_VENDOR_MISSING_RETRIES : MAX_PIPELINE_RETRIES;
+      const cause = websiteMissing ? "website product missing" : "partial image upload";
+      const nextRetry = (prev?.retryCount ?? 0) + 1;
+      if (nextRetry <= budget) {
+        willRetry = true;
+        await ref.set({ retryCount: nextRetry, updatedAt: Date.now() }, { merge: true });
+        try {
+          await onRetryRequested?.({ vendorId: vendor.id, alienProductId, attempt: nextRetry });
+        } catch (re: any) {
+          await log({
+            level: "warn",
+            message: `Retry re-enqueue failed (continuing): ${re.message}`,
+            vendorId: vendor.id,
+            vendorName: vendor.title,
+            productId: String(alienProductId),
+            productTitle: titleForLog,
+            step: "system",
+          }).catch(() => {});
+        }
+        await log({
+          level: "warn",
+          message: `Pipeline retry ${nextRetry}/${budget}: re-enqueued after ${cause}`,
+          vendorId: vendor.id,
+          vendorName: vendor.title,
+          productId: String(alienProductId),
+          productTitle: titleForLog,
+          step: "system",
+        });
+      } else {
+        await log({
+          level: "error",
+          message: `Pipeline retry exhausted (${budget} attempt${budget === 1 ? "" : "s"}) — giving up after ${cause}`,
+          vendorId: vendor.id,
+          vendorName: vendor.title,
+          productId: String(alienProductId),
+          productTitle: titleForLog,
+          step: "system",
+        });
+      }
+    }
+
     const finalStatus = alreadyExists
       ? "skipped_existing"
+      : willRetry
+      ? "pending"
+      : websiteMissing
+      ? "website_product_missing"
       : rolledBack
       ? "rolled_back"
       : "error";
+    // For already-exists, persist the link to the pre-existing Toastd product
+    // so the dashboard can show "mapped (to existing)" rather than treating
+    // this row as orphaned. We rolled back our own Shopify create above, so
+    // clear step1/step2 — only step3 retains the existing productId.
+    const existingId = alreadyExists ? (e as ProductAlreadyExistsError).existingToastdProductId : null;
     await ref.set(
       {
         pipelineStatus: finalStatus,
         lastError: alreadyExists ? null : e.message,
         updatedAt: Date.now(),
-        // Clear any state we just rolled back — this run is now a clean slate.
-        ...(rolledBack
+        // Clear any state we just rolled back — this run is now a clean slate
+        // (also true for the retry case so the next attempt restarts from
+        // step 1 against fresh Shopify + Toastd resources).
+        ...(rolledBack && !alreadyExists
           ? {
               step1: null,
               step2: null,
               step3: null,
             }
           : {}),
+        ...(alreadyExists
+          ? {
+              step1: null,
+              step2: null,
+              step3: {
+                completedAt: Date.now(),
+                toastdProductId: existingId,
+                imagesUploaded: 0,
+                imagesFailed: 0,
+                error: null,
+                fromExisting: true,
+              },
+            }
+          : {}),
       },
       { merge: true },
     );
     await log({
-      level: alreadyExists ? "warn" : "error",
+      level: alreadyExists || willRetry || websiteMissing ? "warn" : "error",
       message: alreadyExists
         ? `Pipeline skipped: ${e.message}; Shopify orphan ${rolledBack ? "rolled back" : "left in place"}`
+        : willRetry
+        ? `Pipeline rolled back and re-enqueued for retry: ${e.message}`
+        : websiteMissing
+        ? `Vendor product no longer exists on its storefront — marked website_product_missing: ${e.message}`
         : rolledBack ? `Pipeline failed and rolled back: ${e.message}` : `Pipeline failed: ${e.message}`,
       vendorId: vendor.id,
       vendorName: vendor.title,
       productId: String(alienProductId),
       productTitle: titleForLog,
       step: "system",
-      meta: { reason, rolledBack },
+      meta: { reason, rolledBack, willRetry },
     });
     // Already-exists isn't a failure — the goal (this product is in Toastd) is
-    // achieved. Report ok:true so vendor sync counts it under "succeeded".
-    return { ok: alreadyExists, productDocId: id, reason: e.message };
+    // achieved. Retries-in-flight are also reported as ok so the queue counter
+    // doesn't tick "failed" for an attempt we're about to redo. Website-missing
+    // IS a failure (we couldn't sync) but a deterministic one — caller still
+    // sees ok:false so the vendor sync's "failed" counter reflects reality.
+    return { ok: alreadyExists || willRetry, productDocId: id, reason: e.message };
   }
 }
 
@@ -688,7 +840,9 @@ export async function syncVendor(
   let failed = 0;
   for (const p of targets) {
     await opts.onProgress?.({ processed, total: targets.length, currentTitle: p.title });
-    const r = await syncOneProduct(vendor, Number(p.id), p);
+    // Pass the retry hook through — vendor sync runs are bulk operations so we
+    // also want partial-image failures to retry rather than land as -1 success.
+    const r = await syncOneProduct(vendor, Number(p.id), p, opts.onRetryRequested, opts.onStep);
     processed += 1;
     if (r.ok) succeeded += 1;
     else failed += 1;

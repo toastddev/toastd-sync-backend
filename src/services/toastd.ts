@@ -10,6 +10,20 @@ export class ToastdAuthError extends Error {
   }
 }
 
+/**
+ * Toastd's /api/ai/product_create returned 404 with the stable reason code
+ * `vendor_product_not_found`. The vendor's storefront no longer hosts the
+ * product handle (deleted, renamed, or never published). Pipeline catches this
+ * as a distinct case — single retry only, then mark the row as
+ * `website_product_missing` so the dashboard can show it clearly.
+ */
+export class VendorProductNotFoundError extends Error {
+  constructor(public url: string) {
+    super(`Vendor product not found at ${url}`);
+    this.name = "VendorProductNotFoundError";
+  }
+}
+
 function headers(token: string | undefined, extra: Record<string, string> = {}) {
   const h: Record<string, string> = {
     "Content-Type": "application/json",
@@ -75,7 +89,18 @@ export interface AiProductCreateInput {
 }
 
 export async function aiProductCreate(input: AiProductCreateInput, token?: string) {
-  return jsonCall<any>("POST", "/api/ai/product_create", token, input);
+  try {
+    return await jsonCall<any>("POST", "/api/ai/product_create", token, input);
+  } catch (e: any) {
+    // Toastd backend returns 404 with reason `vendor_product_not_found` when
+    // the vendor's storefront 404s on the product handle. Translate that into
+    // a typed error so pipeline.ts can apply the single-retry policy.
+    const msg: string = typeof e?.message === "string" ? e.message : "";
+    if (msg.includes("404") && msg.includes("vendor_product_not_found")) {
+      throw new VendorProductNotFoundError(input.url);
+    }
+    throw e;
+  }
 }
 
 export async function createProduct(payload: any, token?: string) {

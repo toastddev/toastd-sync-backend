@@ -74,9 +74,22 @@ export interface ProductRecord {
     imagesUploaded?: number;
     imagesFailed?: number;
     error?: string | null;
+    // True when step3 didn't actually create the Toastd product — the
+    // backend reported the slug already existed and we mapped to the
+    // pre-existing record. Distinguishes "we created this" from "this
+    // was already in Toastd before we synced".
+    fromExisting?: boolean;
   };
-  pipelineStatus?: "pending" | "running" | "done" | "error";
+  pipelineStatus?:
+    | "pending"
+    | "running"
+    | "done"
+    | "error"
+    | "skipped_existing"
+    | "rolled_back"
+    | "website_product_missing";
   lastError?: string | null;
+  retryCount?: number;
   updatedAt?: number;
   raw?: unknown;
 }
