@@ -80,6 +80,56 @@ export async function getBrand(brandId: string, token?: string): Promise<ToastdB
   }
 }
 
+export interface ToastdCategory {
+  id: string;
+  name: string;
+  slug: string;
+}
+
+/**
+ * Loads every Toastd category once per pipeline run so we can resolve the
+ * AI-returned `mainCategoryName` to its UUID. Without this the sync would
+ * persist `mainCategoryId = null` (the AI endpoint never returns the UUID,
+ * only the name), which is what broke admin's UpdateProduct fetch.
+ */
+export async function listCategories(token?: string): Promise<ToastdCategory[]> {
+  const r = await jsonCall<any>("GET", "/api/category", token);
+  const arr = Array.isArray(r) ? r : r?.data ?? r?.content ?? [];
+  return Array.isArray(arr) ? arr.map((c: any) => ({ id: c.id, name: c.name, slug: c.slug })) : [];
+}
+
+/**
+ * Lookup an existing product by (brandId, externalProductId). The Shopify sync
+ * pipeline calls this BEFORE creating/AI-ing a new product so that a re-sync
+ * (or a vendor product already mapped under a different slug) doesn't insert a
+ * duplicate row. Returns null on 404; throws on other transport errors.
+ */
+export async function findExistingProductByBrandAndExternalId(
+  brandId: string,
+  externalProductId: string,
+  token?: string,
+): Promise<{ id: string; slug?: string } | null> {
+  const qs = `?brandId=${encodeURIComponent(brandId)}&externalProductId=${encodeURIComponent(externalProductId)}`;
+  const res = await request(`${BASE}/api/product/by-external${qs}`, {
+    method: "GET",
+    headers: headers(token),
+  });
+  const text = await res.body.text();
+  if (res.statusCode === 404) return null;
+  if (res.statusCode === 401 || res.statusCode === 403) throw new ToastdAuthError(`Toastd by-external ${res.statusCode}`);
+  if (res.statusCode >= 400) {
+    throw new Error(`Toastd GET by-external ${res.statusCode}: ${text.slice(0, 300)}`);
+  }
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed?.id) return null;
+    return { id: parsed.id, slug: parsed.slug };
+  } catch {
+    return null;
+  }
+}
+
 export interface AiProductCreateInput {
   url: string;
   slug: string;

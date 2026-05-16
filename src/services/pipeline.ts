@@ -22,8 +22,10 @@ import {
   createProduct,
   deleteToastdProduct,
   downloadAndConvertWebp,
+  findExistingProductByBrandAndExternalId,
   getBrand,
   getPresignedUrl,
+  listCategories,
   listProductFiles,
   recordFile,
   uploadToGcs,
@@ -42,10 +44,43 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * as "skipped_existing" rather than a true error.
  */
 export class ProductAlreadyExistsError extends Error {
-  constructor(public existingToastdProductId: string, public slug: string) {
+  constructor(
+    public existingToastdProductId: string,
+    public slug: string,
+    /**
+     * When true the existing Toastd product was matched by (brandId,
+     * externalProductId) BEFORE we created any new Shopify product — so the
+     * shopifyProductGid for this run already points at the legitimate, in-use
+     * product. Catch path uses this to skip the Shopify rollback that the
+     * slug-collision case relies on.
+     */
+    public matchedByExternalId: boolean = false,
+  ) {
     super(`Toastd product with slug "${slug}" already exists (id=${existingToastdProductId})`);
     this.name = "ProductAlreadyExistsError";
   }
+}
+
+/**
+ * Normalize a slug so it survives storefront URLs, JSON, and CMS routing. The
+ * Shopify handle we start from can contain emojis (🐰) or punctuation (/ % ?)
+ * which break SEO and route resolution downstream. Lowercase ASCII + dashes
+ * only.
+ */
+function slugify(input: string): string {
+  if (!input) return "";
+  return input
+    .normalize("NFKD")
+    // Strip combining diacritics first so e.g. "café" → "cafe"; then drop
+    // anything else outside ASCII (emoji, surrogate pairs, other scripts).
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^\x00-\x7F]/g, "")
+    .toLowerCase()
+    // Anything that isn't a-z, 0-9, or `-` becomes a separator.
+    .replace(/[^a-z0-9]+/g, "-")
+    // Collapse runs of dashes and trim them.
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 /**
@@ -210,10 +245,52 @@ export async function runStep3(
   const tdTok = settings.toastdAdminToken;
   if (!tdTok) throw new Error("Toastd admin token (x-toastd-access-token) not set in Settings");
   const brand = await getBrand(vendor.brandId, tdTok);
-  const brandSlug = brand?.slug || vendor.brandName?.toLowerCase().replace(/\s+/g, "-") || vendor.brandId;
+  // brand?.slug is already stored normalized in our DB, but if we fall back to
+  // vendor.brandName we still need to scrub emojis / punctuation. slugify is
+  // idempotent so running it on the brand slug too is safe.
+  const brandSlug = slugify(brand?.slug || vendor.brandName || vendor.brandId);
   const url = `https://${vendor.domain}/products/${alienProduct.handle}`;
-  const slug = `${brandSlug}-${alienProduct.handle}`;
+  // The vendor's Shopify handle is the part the storefront cares about. It
+  // can include emojis (🐰) and punctuation that route resolvers reject — run
+  // it through slugify so the resulting slug only ever contains [a-z0-9-].
+  const slug = slugify(`${brandSlug}-${alienProduct.handle}`);
   const price = pickPrice(alienProduct);
+
+  // ── Pre-flight duplicate check ────────────────────────────────────────────
+  // Before paying for the AI call + creating an empty Toastd record, ask the
+  // backend whether (brandId, externalProductId) already exists. This is the
+  // root-cause fix for the case where the same product had been imported
+  // earlier under a different slug and step3b's slug-only idempotency check
+  // therefore couldn't see the duplicate. Found → bubble up via the existing
+  // already-exists error path so firestore links to the existing product
+  // instead of inserting a second row.
+  try {
+    const existing = await findExistingProductByBrandAndExternalId(vendor.brandId, shopifyProductGid, tdTok);
+    if (existing?.id) {
+      await log({
+        level: "warn",
+        message: `Step 3 pre-check: product already exists for brand+externalProductId (id=${existing.id}); skipping AI + create`,
+        vendorId: vendor.id,
+        vendorName: vendor.title,
+        productTitle: alienProduct.title,
+        step: "step3a",
+        meta: { existingId: existing.id, externalProductId: shopifyProductGid },
+      });
+      throw new ProductAlreadyExistsError(existing.id, existing.slug ?? slug, /* matchedByExternalId */ true);
+    }
+  } catch (e) {
+    // Re-throw our own typed already-exists signal; swallow other lookup
+    // failures so a transient backend hiccup can't block fresh syncs.
+    if (e instanceof ProductAlreadyExistsError) throw e;
+    await log({
+      level: "warn",
+      message: `Step 3 pre-check failed (continuing as if not found): ${(e as Error).message}`,
+      vendorId: vendor.id,
+      vendorName: vendor.title,
+      productTitle: alienProduct.title,
+      step: "step3a",
+    });
+  }
 
   await log({
     level: "info",
@@ -239,7 +316,47 @@ export async function runStep3(
   const expiry = new Date(Date.now() + 2 * 365 * 24 * 60 * 60 * 1000).toISOString();
   const tagIds = (ai.tagIds as string[] | undefined) ?? [];
   const subCategoryIds = (ai.subCategoryIds as string[] | undefined) ?? [];
-  const mainCategoryId = (ai.mainCategoryId as string | undefined) ?? null;
+  // The AI endpoint returns the human-readable `mainCategoryName` (see
+  // AiProductCreateResponse.java) but never the UUID, so the previous
+  // `ai.mainCategoryId` read was always undefined and every synced product
+  // landed with `mainCategory: null` — that's what broke the admin
+  // UpdateProduct fetch. Resolve the name → id by consulting the category list
+  // here; if nothing matches we fall through to null and let the admin layer
+  // guard against it.
+  let mainCategoryId: string | null = (ai.mainCategoryId as string | undefined) ?? null;
+  if (!mainCategoryId) {
+    const rawName = (ai.mainCategoryName as string | undefined)?.trim();
+    if (rawName) {
+      try {
+        const categories = await listCategories(tdTok);
+        const wantedSlug = slugify(rawName);
+        const match =
+          categories.find((c) => c.name?.toLowerCase() === rawName.toLowerCase()) ??
+          categories.find((c) => (c.slug ?? "").toLowerCase() === wantedSlug);
+        if (match) {
+          mainCategoryId = match.id;
+        } else {
+          await log({
+            level: "warn",
+            message: `AI mainCategoryName "${rawName}" did not match any Toastd category — saving with null mainCategory`,
+            vendorId: vendor.id,
+            vendorName: vendor.title,
+            productTitle: alienProduct.title,
+            step: "step3b",
+          });
+        }
+      } catch (e: any) {
+        await log({
+          level: "warn",
+          message: `Could not load Toastd categories for fallback (${e.message}) — saving with null mainCategory`,
+          vendorId: vendor.id,
+          vendorName: vendor.title,
+          productTitle: alienProduct.title,
+          step: "step3b",
+        });
+      }
+    }
+  }
 
   const productPayload: any = {
     shortDescription: ai.shortDescription,
@@ -668,8 +785,22 @@ export async function syncOneProduct(
     // partial-image-upload and website-missing retry paths we MUST roll back
     // unconditionally — a half-imaged or referenced-but-deleted product is
     // exactly what we're avoiding by re-enqueuing or marking missing.
+    //
+    // SPECIAL CASE: when the already-exists signal came from our pre-flight
+    // (brandId, externalProductId) lookup, the shopifyProductGid we resolved
+    // points at the legitimate, in-use Shopify product for the EXISTING DB
+    // row — there is no orphan to delete. Skip the shopify side of rollback;
+    // there's no Toastd record we created this run either, so nothing else
+    // to undo.
+    const matchedByExternalId = alreadyExists && (e as ProductAlreadyExistsError).matchedByExternalId === true;
     let rolledBack = false;
-    if (reason !== "shopify_auth" && (created.shopifyProductGid || created.toastdProductId)) {
+    if (matchedByExternalId) {
+      // Nothing to roll back — pre-flight detected the duplicate before any
+      // create. Mark as "rolled back" only in the sense that there's no
+      // partial state to clean up; final-status logic below treats this as
+      // skipped_existing regardless.
+      rolledBack = true;
+    } else if (reason !== "shopify_auth" && (created.shopifyProductGid || created.toastdProductId)) {
       const safe = incompleteImages || websiteMissing
         ? true
         : await canRollback(created.toastdProductId, created.step3ImagesUploaded, settings.toastdAdminToken);
